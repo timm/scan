@@ -1,193 +1,316 @@
-"""
-scan.py — geometry-based active learning + decision tree
-
-  m        : o(hdr,nc,col,xs,ys,rows)
-    hdr    : [str]                  column names
-    nc     : int                    number of columns
-    col    : [None|o(lo,hi,heaven)] None=sym; heaven=None → num; 0|1 → y
-    xs     : [int]                  x-col indices (not y)
-    ys     : [int]                  y-col indices
-    rows   : [[val]]                shuffled, coerced rows
-
-  node : o(rows,pre,kids,cut?)   cut=(k,v) split on col k at value v
-  row  : [val]                   val is float|str|"?"
-"""
-import re, math, random
+#!/usr/bin/env python3 -B
+# scan.py — geometry-based active learning + decision tree
+import sys, re, math, random
+from pathlib import Path
 
 class o(dict):
   __getattr__ = dict.__getitem__; __setattr__ = dict.__setitem__
+
+# Added all the hidden magic numbers here
+the = o(seed=42, stop=4, rounds=4, labels=10, check=5, 
+        w=32, poles=20, sd=2.56, p90=.9, p10=.1, eps=1e-32)
+
+EG = Path.home() / "gits/moot/optimize/misc/auto93.csv"
+def csv(f=str(EG)): return open(f).read() if Path(f).exists() else ""
 
 # ---- lib ----
 def isnum(x):
   try: float(x); return True
   except: return False
 
-def norm(v,lo,hi): return (v-lo)/(hi-lo+1e-32)
+def thing(x):
+  if str(x).lower() in ["true", "t"]: return True
+  if str(x).lower() in ["false", "f"]: return False
+  try: return int(x)
+  except:
+    try: return float(x)
+    except: return str(x).strip()
+
+def norm(v, lo, hi): return (v-lo) / (hi-lo+the.eps)
 
 def clean(v):
-  v = v.strip()
-  return "?" if not v or re.match(r"^[Nn][Aa]$",v) else v
+  v = str(v).strip()
+  return "?" if not v or re.match(r"^[Nn][Aa]$", v) else v
 
-def dist(a,b,k,m):
+# ---- distance ----
+def distVal(a, b, c):
+  n = lambda v: norm(float(v), c.lo, c.hi)
+  if a=="?": return max(n(b), 1-n(b))
+  if b=="?": return max(n(a), 1-n(a))
+  return (n(a)-n(b))**2
+
+def dist(a, b, k, m):
   c = m.col[k]
   if not c: return 0 if a==b else 1
   if a=="?" and b=="?": return 1
-  n = lambda v: norm(float(v), c.lo, c.hi)
-  if a=="?": v = n(b); return max(v,1-v)
-  if b=="?": v = n(a); return max(v,1-v)
-  return (n(a)-n(b))**2
+  return distVal(a, b, c)
 
-def dists(r1,r2,m):
-  ds = [dist(r1[k],r2[k],k,m) for k in range(m.nc)
+def dists(r1, r2, m):
+  ds = [dist(r1[k], r2[k], k, m) for k in range(m.nc)
         if not(r1[k]=="?" and r2[k]=="?")]
   return math.sqrt(sum(ds)/len(ds)) if ds else 1
 
-# ---- prep ----
-def prep(csv,seed=42):
-  lines = csv.strip().split("\n")
-  hdr = [h.strip() for h in lines[0].split(",")]; nc = len(hdr)
-  lo,hi = {},{}
-  rows = [[clean(v) for v in l.split(",")] for l in lines[1:]]
+# ---- prep / data ----
+def dataBounds(rows):
+  lo, hi = {}, {}
   for r in rows:
-    for k,v in enumerate(r):
-      if not isnum(v): continue
-      lo[k] = min(lo.get(k,float(v)),float(v))
-      hi[k] = max(hi.get(k,float(v)),float(v))
-  heaven = {k:(0 if h[-1:]=="-" else 1)
-            for k,h in enumerate(hdr) if h[-1:] in ("-","+")}
-  col = [None if k not in lo else o(lo=lo[k], hi=hi[k], heaven=heaven.get(k))
-         for k in range(nc)]
-  xs = [k for k in range(nc) if not(col[k] and col[k].heaven is not None)]
-  ys = [k for k in range(nc) if     col[k] and col[k].heaven is not None]
-  coerced = [[float(v) if col[k] and v!="?" else v
-              for k,v in enumerate(r)] for r in rows]
-  random.seed(seed)
-  random.shuffle(coerced)
-  return o(hdr=hdr, nc=nc, col=col, xs=xs, ys=ys, rows=coerced)
+    for k, v in enumerate(r):
+      if isnum(v):
+        lo[k] = min(lo.get(k, float(v)), float(v))
+        hi[k] = max(hi.get(k, float(v)), float(v))
+  return lo, hi
+
+def dataCol(k, h, lo, hi):
+  if k not in lo: return None
+  heaven = 0 if h[-1:]=="-" else (1 if h[-1:]=="+" else None)
+  return o(lo=lo[k], hi=hi[k], heaven=heaven)
+
+def dataCoerce(rows, col):
+  out = [[float(v) if col[k] and v!="?" else v 
+          for k,v in enumerate(r)] for r in rows]
+  random.seed(the.seed); random.shuffle(out)
+  return out
+
+def prep(csv_str):
+  lines = csv_str.strip().split("\n")
+  hdr   = [h.strip() for h in lines[0].split(",")]; nc = len(hdr)
+  rows  = [[clean(v) for v in l.split(",")] for l in lines[1:]]
+  lo,hi = dataBounds(rows)
+  col   = [dataCol(k, hdr[k], lo, hi) for k in range(nc)]
+  xs    = [k for k in range(nc) if not(col[k] and col[k].heaven is not None)]
+  ys    = [k for k in range(nc) if     col[k] and col[k].heaven is not None]
+  return o(hdr=hdr, nc=nc, col=col, xs=xs, ys=ys, rows=dataCoerce(rows, col))
 
 # ---- score ----
-def yscore(row,m):
+def yscore(row, m):
   ds = [(norm(row[k], m.col[k].lo, m.col[k].hi) - m.col[k].heaven)**2
         for k in m.ys]
   return math.sqrt(sum(ds)/len(ds)) if ds else 0
 
-# ---- half ----
-def poles(rows,m):
-  s = rows[:20]; best = -1; ai,bi = 0,1
-  for i,a in enumerate(s):
-    for j,b in enumerate(s[i+1:],i+1):
-      if (d:=dists(a,b,m)) > best:
-        best,ai,bi = d,i,j
+# ---- cluster ----
+def clusPoles(rows, m):
+  s = rows[:the.poles]; best, ai, bi = -1, 0, 1
+  for i, a in enumerate(s):
+    for j, b in enumerate(s[i+1:], i+1):
+      if (d:=dists(a, b, m)) > best: best, ai, bi = d, i, j
   return (bi,ai) if yscore(rows[ai],m) > yscore(rows[bi],m) else (ai,bi)
 
-def far(cluster,m):
-  rows = list(cluster); ai,bi = poles(rows,m)
+def clusFar(cluster, m):
+  rows = list(cluster); ai, bi = clusPoles(rows, m)
   a = rows.pop(ai); b = rows.pop(bi-1 if bi>ai else bi)
-  return [a,b]+rows
+  return [a, b] + rows
 
-def half(cluster,m):
-  a,b,*rest = cluster; A,B = [a],[b]
+def clusHalf(cluster, m):
+  a, b, *rest = cluster; A, B = [a], [b]
   for r in rest:
-    (A if dists(r,a,m)<=dists(r,b,m) else B).append(r)
-  return [A,B]
+    (A if dists(r, a, m) <= dists(r, b, m) else B).append(r)
+  return [A, B]
 
-def twin(clusters,m):
-  return [c for cl in clusters for c in half(far(cl,m),m)]
+def clusTwin(clusters, m):
+  return [c for cl in clusters for c in clusHalf(clusFar(cl, m), m)]
 
-# ---- sum ----
-def numstat(vals):
+# ---- stats ----
+def statNum(vals):
+  if not vals: return o(mu=0, sd=0)
   s = sorted(vals); n = len(s)
-  return o(mu = round(sum(s)/n,2),
-           sd = round((s[int(.9*n)]-s[int(.1*n)])/2.56,2))
+  mu = round(sum(s)/n, 2)
+  sd = round((s[int(the.p90*n)]-s[int(the.p10*n)])/the.sd, 2)
+  return o(mu=mu, sd=sd)
 
-def symstat(vals):
+def statSym(vals):
+  if not vals: return o(n=0, ent=0)
   n = len(vals); c = {v:vals.count(v) for v in set(vals)}
-  return o(n=n, ent=round(-sum(p/n*math.log2(p/n) for p in c.values()),2))
+  ent = round(-sum(p/n*math.log2(p/n) for p in c.values()), 2)
+  return o(n=n, ent=ent)
 
-def _vals(rows,k): return [r[k] for r in rows if r[k]!="?"]
+def statVals(rows, k): 
+  return [r[k] for r in rows if r[k]!="?"]
 
-def summarize(cluster,m):
-  return {m.hdr[k]:(numstat if m.col[k] else symstat)(_vals(cluster,k))
+def statSum(cluster, m):
+  return {m.hdr[k]:(statNum if m.col[k] else statSym)(statVals(cluster, k))
           for k in range(m.nc)}
 
-# ---- acquire + learn ----
-def acquire(clusters,best,m):
-  return min(clusters,key=lambda c:dists(c[0],best,m))[0]
+def statMean(a): 
+  return sum(a)/len(a) if a else 0
 
-def learn(csv,rounds=4,labels=10,seed=42,oracle=None):
-  m = prep(csv,seed)
-  clusters = [m.rows]
-  for _ in range(rounds):
-    clusters = twin(clusters,m)
-  clusters.sort(key=lambda c:yscore(c[0],m))
+def statSd(a):
+  if len(a)<2: return 0
+  mu = statMean(a)
+  return math.sqrt(sum((v-mu)**2 for v in a)/(len(a)-1))
+
+def statMode(a): 
+  return max(set(a), key=a.count) if a else None
+
+def wins(rows, m):
+  scores = [yscore(r, m) for r in rows]
+  lo = min(scores) if scores else 0
+  mu = statMean(scores)
+  return lambda r: int(100 * (1 - (yscore(r, m) - lo) / (mu - lo + the.eps)))
+
+# ---- acquire ----
+def acqBest(clusters, best, m):
+  return min(clusters, key=lambda c: dists(c[0], best, m))[0]
+
+def acqClusters(rows, m):
+  clusters = [rows]
+  for _ in range(the.rounds): clusters = clusTwin(clusters, m)
+  return sorted(clusters, key=lambda c: yscore(c[0], m))
+
+def acqLearn(rows, m, oracle=None):
+  clusters = acqClusters(rows, m)
   log, best = [], clusters[0][0]
-  for i in range(labels):
-    log.append(o(label=i+1, row=best, score=(oracle or yscore)(best,m)))
-    best = acquire(clusters,best,m)
-  return o(clusters=clusters, log=log,
-           summary=[summarize(c,m) for c in clusters])
+  for i in range(the.labels):
+    log.append(o(label=i+1, row=best, score=(oracle or yscore)(best, m)))
+    best = acqBest(clusters, best, m)
+  return o(clusters=clusters, log=log, summary=[statSum(c, m) for c in clusters])
 
 # ---- tree ----
-def _mean(a): return sum(a)/len(a) if a else 0
-
-def _sd(a):
-  if len(a)<2: return 0
-  mu = _mean(a); return math.sqrt(sum((v-mu)**2 for v in a)/(len(a)-1))
-
-def _mode(a): return max(set(a),key=a.count)
-
-def _sval(k,top,bot,m):   # split value: midpoint (num) or mode of top (sym)
-  a = _vals(top,k)
+def treeVal(k, top, bot, m):
+  a = statVals(top, k)
   if m.col[k]:
-    b = _vals(bot,k)
-    return (_mean(a)+_mean(b))/2 if a and b else None
-  return _mode(a) if a else None
+    b = statVals(bot, k)
+    return (statMean(a)+statMean(b))/2 if a and b else None
+  return statMode(a)
 
-def _part(rows,k,v,m):    # partition; unknowns go right
-  L,R = [],[]
+def treePart(rows, k, v, m):
+  L, R = [], []
   for r in rows:
-    if r[k] != "?" and (r[k]<=v if m.col[k] else r[k]==v):
-      L.append(r)
-    else:
-      R.append(r)
-  return L,R
+    if r[k] != "?" and (r[k]<=v if m.col[k] else r[k]==v): L.append(r)
+    else: R.append(r)
+  return L, R
 
-def grow(rows,m,stop=4,pre=""):
+def treeWeight(l, r, m):
+  yl = [yscore(x, m) for x in l]; yr = [yscore(x, m) for x in r]
+  return statSd(yl)*len(l) + statSd(yr)*len(r)
+
+def treeBestCol(rows, m, top, bot):
+  bv, bk, bval = 1/the.eps, None, None
+  for k in m.xs:
+    v = treeVal(k, top, bot, m)
+    if v is None: continue
+    l, r = treePart(rows, k, v, m)
+    if not l or not r: continue
+    if (w := treeWeight(l, r, m)) < bv: bv, bk, bval = w, k, v
+  return bk, bval
+
+def treeKids(node, rows, bk, bval, m):
+  l, r = treePart(rows, bk, bval, m)
+  h = m.hdr[bk]; f = f"{bval:.2f}" if m.col[bk] else str(bval)
+  s1, s2 = ((f"{h}<={f}", f"{h}> {f}") if m.col[bk] else (f"{h}=={f}", f"{h}!={f}"))
+  node.cut = (bk, bval)
+  node.kids = [treeGrow(l, m, s1), treeGrow(r, m, s2)]
+
+def treeGrow(rows, m, pre=""):
   node = o(rows=rows, pre=pre, kids=[])
-  if len(rows) > stop*2:
-    rs = sorted(rows, key=lambda r:yscore(r,m))
-    n = len(rs)//2
-    top,bot = rs[:n],rs[n:]
-    bv,bk,bval = 1e32,None,None
-    for k in m.xs:
-      v = _sval(k,top,bot,m)
-      if v is None: continue
-      l,r = _part(rows,k,v,m)
-      if not l or not r: continue
-      yl = [yscore(x,m) for x in l]
-      yr = [yscore(x,m) for x in r]
-      w = _sd(yl)*len(l) + _sd(yr)*len(r)
-      if w < bv: bv,bk,bval = w,k,v
-    if bk is not None:
-      l,r = _part(rows,bk,bval,m)
-      h = m.hdr[bk]; f = f"{bval:.2f}" if m.col[bk] else str(bval)
-      s1,s2 = ((f"{h}<={f}",f"{h}> {f}")
-               if m.col[bk] else (f"{h}=={f}",f"{h}!={f}"))
-      node.cut = (bk,bval)
-      node.kids = [grow(l,m,stop,s1), grow(r,m,stop,s2)]
+  if len(rows) > the.stop * 2:
+    rs = sorted(rows, key=lambda r: yscore(r, m))
+    bk, bval = treeBestCol(rows, m, rs[:len(rs)//2], rs[len(rs)//2:])
+    if bk is not None: treeKids(node, rows, bk, bval, m)
   return node
 
-def leaf(node,row,m):
+def treeLeaf(node, row, m):
   if not node.kids: return node
-  k,v = node.cut
+  k, v = node.cut
   ok = row[k]!="?" and (row[k]<=v if m.col[k] else row[k]==v)
-  return leaf(node.kids[0 if ok else 1],row,m)
+  return treeLeaf(node.kids[0 if ok else 1], row, m)
 
-def tshow(node,m,lvl=0,w=32):
+def treeShow(node, m, lvl=0):
   lbl = ('|  '*(lvl-1) if lvl else '')+node.pre
   if not node.kids:
-    mu = _mean([yscore(r,m) for r in node.rows])
-    print(f"{lbl:<{w}} n={len(node.rows):3d}  y={mu:.2f}")
+    mu = statMean([yscore(r, m) for r in node.rows])
+    print(f"{lbl:<{the.w}} n={len(node.rows):3d}  y={mu:.2f}")
   else:
     if lbl: print(lbl)
-  for kid in node.kids: tshow(kid,m,lvl+1,w)
+    for kid in node.kids: treeShow(kid, m, lvl+1)
+
+
+# ---- tests ----
+def tests(*ignore):
+  for k, fn in list(globals().items()):
+    if k.startswith("test_") and k not in ignore:
+       yield k,fn
+   
+def test_all():
+  for k, fn in tests("test_all", "test_h", "test_help"):
+    print(f"? {k} :",end="")
+    random.seed(the.seed)
+    try: fn(); print(f"✅ PASS")
+    except Exception as e: print(f"❌ FAIL: {e}")
+
+def test_h():
+  print("Usage: scan.py [--all] [--test_name] [args...]")
+  for k, fn in tests():
+     print(f"  --{k[5:]:10} {' '.join(fn.__annotations__)}") 
+
+test_help = test_h
+
+def test_o():
+  t = o(a=1, b=2); t.c = 3
+  assert t.a == 1 and t["b"] == 2 and t.c == 3
+
+def test_clean_isnum():
+  assert isnum("3.14") and not isnum("a")
+  assert clean(" NA ") == "?" and clean(" a ") == "a"
+  assert thing("true") is True and thing("42") == 42
+
+def test_prep(file: str = str(EG)):
+  m = prep(csv(file))
+  assert m.nc > 0 and len(m.rows) > 10 and len(m.hdr) == m.nc
+
+def test_cols(file: str = str(EG)):
+  m = prep(csv(file))
+  assert m.xs and m.ys and set(m.xs).isdisjoint(m.ys)
+
+def test_numstat():
+  st = statNum([10, 20, 30, 40, 50])
+  assert st.mu == 30.0 and st.sd > 0
+
+def test_symstat():
+  st = statSym(["a", "a", "b", "c"])
+  assert st.n == 4 and st.ent > 0
+
+def test_dist(file: str = str(EG)):
+  m = prep(csv(file))
+  assert 0 <= dists(m.rows[0], m.rows[1], m) <= 1
+
+def test_yscore(file: str = str(EG)):
+  m = prep(csv(file))
+  assert 0 <= yscore(m.rows[0], m) <= 1
+
+def test_cluster(file: str = str(EG)):
+  m = prep(csv(file))
+  res = clusHalf(m.rows, m)
+  assert len(res[0]) + len(res[1]) == len(m.rows)
+
+def test_tree(file: str = str(EG)):
+  m = prep(csv(file))
+  print("\nTree:"); treeShow(treeGrow(m.rows[:50], m), m)
+
+def test_acquire(file: str = str(EG)):
+  m = prep(csv(file))
+  n = len(m.rows) // 2
+  train, test = m.rows[:n], m.rows[n:]
+  score_win = wins(m.rows, m) 
+  res = acqLearn(train, m)
+  t = treeGrow([x.row for x in res.log], m)
+  def pred(r):
+    nd = treeLeaf(t, r, m)
+    return statMean([yscore(x, m) for x in nd.rows])
+  guess = sorted(test, key=pred)
+  best_row = guess[0]
+  print(score_win(best_row))
+ 
+# ---- cli ----
+def cli():
+  args = sys.argv[1:]
+  if not args: return test_all()
+  while args:
+    random.seed(the.seed)
+    k = args.pop(0).lstrip("-")
+    if fn := globals().get(f"test_{k}"):
+      fargs = [thing(args.pop(0)) for _ in fn.__annotations__ if args]
+      fn(*fargs)
+    elif k in the: the[k] = thing(args.pop(0))
+    else: print(f"Unknown option: {k}")
+
+if __name__ == "__main__": cli()
